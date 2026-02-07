@@ -2,22 +2,24 @@
 
 ## Status
 - Overall: in progress
-- Last updated: 2026-01-28
+- Last updated: 2026-02-08
 
 ## Milestones
 - [x] Project skeleton (firmware + pc receiver)
-- [ ] Hardware bring-up (SensairShuttle + BMI270 shuttle board)
-- [ ] BMI270 driver (use official driver if available, otherwise minimal I2C)
-- [ ] Sensor data pipeline on ESP32-C5 (sampling, timestamping, buffering)
-- [ ] Transport to PC via Wi-Fi UDP
-- [ ] Python receiver + storage format
+- [x] Hardware bring-up (SensairShuttle + BMI270 shuttle board)
+- [x] BMI270 driver (integrated via `bmi270_sensor` component)
+- [x] Sensor data pipeline on ESP32-C5 (sampling, timestamping, buffering)
+- [x] Transport to PC via Wi-Fi UDP
+- [x] Python receiver + storage format
 - [ ] Trajectory capture & labeling workflow
 - [ ] Pattern learning baseline (DTW/feature matching)
 - [ ] End-to-end demo (record -> learn -> send -> receive -> classify)
 
 ## Current Focus
-- Wire BMI270 over I2C and confirm chip ID read
+- Verify sensor scaling/calibration and define data capture + labeling workflow
 
 ## Notes
 - UDP frame format: little-endian <q6h (ts_us + ax,ay,az,gx,gy,gz)
-- Update Wi-Fi SSID/PASS and UDP destination IP in `firmware/main/udp_sender.c`.
+- BMI270 I2C address detected at 0x69; chip_id read OK; live samples confirmed over UDP.
+- Pin defs aligned to ESP-SensairShuttle v1.0: I2C SDA=GPIO2, SCL=GPIO3; EXT_IO2=GPIO5, EXT_IO1=GPIO4; WS2812_CTRL=GPIO1.
+- NVS-backed Wi-Fi/UDP config with optional boot provisioning; UDP heartbeat enabled for bring-up.

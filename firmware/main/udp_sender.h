@@ -2,6 +2,7 @@
 
 #include "esp_err.h"
 #include <stdint.h>
+#include "lwip/sockets.h"
 #include "bmi270_i2c.h"
 
 #ifdef __cplusplus
@@ -15,6 +16,7 @@ typedef struct {
 
 esp_err_t udp_sender_init(udp_sender_t *udp);
 int udp_sender_send_sample(udp_sender_t *udp, const bmi270_sample_t *s);
+int udp_sender_send_heartbeat(udp_sender_t *udp, int64_t ts_us);
 
 #ifdef __cplusplus
 }

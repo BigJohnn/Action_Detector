@@ -1,0 +1,27 @@
+menu "Action Detect"
+
+config ACTION_WIFI_SSID
+    string "Wi-Fi SSID"
+    default "YOUR_SSID"
+
+config ACTION_WIFI_PASS
+    string "Wi-Fi password"
+    default "YOUR_PASSWORD"
+
+config ACTION_UDP_DEST_IP
+    string "UDP destination IP"
+    default "192.168.1.5"
+
+config ACTION_UDP_DEST_PORT
+    int "UDP destination port"
+    default 9000
+
+config ACTION_NET_NVS_NAMESPACE
+    string "NVS namespace for net config"
+    default "net"
+
+config ACTION_NET_PROVISION_ON_BOOT
+    bool "Provision NVS from Kconfig on boot (only missing keys)"
+    default n
+
+endmenu

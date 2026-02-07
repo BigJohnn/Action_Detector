@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include "driver/i2c.h"
 #include "esp_err.h"
+#include "i2c_bus.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -22,6 +23,8 @@ typedef struct {
 typedef struct {
     i2c_port_t port;
     uint8_t addr;
+    i2c_bus_handle_t bus;
+    void *bmi_handle;
 } bmi270_ctx_t;
 
 esp_err_t bmi270_i2c_init(bmi270_ctx_t *ctx, i2c_port_t port, int sda, int scl);

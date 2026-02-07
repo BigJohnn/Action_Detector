@@ -1,0 +1,5 @@
+dependencies:
+  espressif/bmi270_sensor:
+    version: "*"
+  espressif/i2c_bus:
+    version: "*"
