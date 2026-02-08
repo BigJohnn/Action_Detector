@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 import argparse
+import array
 import json
 import math
+import os
 import socket
 import struct
+import subprocess
+import tempfile
 import time
 from collections import deque
 from pathlib import Path
+import shutil
+import sys
+import wave
 
 from dtw_baseline import (
     LabeledSequence,
@@ -120,6 +127,93 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run one capture/inference and exit",
     )
+    parser.add_argument(
+        "--tts-enable",
+        action="store_true",
+        help="Speak recognized action label through board speaker (streamed PCM or board-local label mode)",
+    )
+    parser.add_argument(
+        "--tts-output-mode",
+        choices=("stream", "board-local"),
+        default="stream",
+        help="stream: send PCM; board-local: send only label and play preloaded clip on board",
+    )
+    parser.add_argument(
+        "--tts-dest-ip",
+        default="auto",
+        help="Board IP for TTS UDP. Use 'auto' to use source IP from incoming IMU packets",
+    )
+    parser.add_argument("--tts-port", type=int, default=9001, help="Board UDP port for TTS audio")
+    parser.add_argument(
+        "--tts-voice",
+        default="Tingting",
+        help="macOS say voice name (used when --tts-enable)",
+    )
+    parser.add_argument("--tts-rate", type=int, default=200, help="macOS say speech rate (WPM)")
+    parser.add_argument(
+        "--tts-language",
+        choices=("zh", "en"),
+        default="zh",
+        help="Spoken phrase language for action labels",
+    )
+    parser.add_argument(
+        "--tts-sample-rate",
+        type=int,
+        default=24000,
+        help="Target PCM sample rate sent to board",
+    )
+    parser.add_argument(
+        "--tts-cooldown-sec",
+        type=float,
+        default=0.8,
+        help="Minimum interval between two announcements",
+    )
+    parser.add_argument(
+        "--tts-repeat",
+        action="store_true",
+        help="Allow repeated announcement for the same consecutive label",
+    )
+    parser.add_argument(
+        "--tts-gain",
+        type=float,
+        default=0.22,
+        help="Linear output gain for TTS PCM (0..1.0, lower reduces distortion)",
+    )
+    parser.add_argument(
+        "--tts-target-peak",
+        type=float,
+        default=0.24,
+        help="Auto-limit target peak level (fraction of full-scale, 0..1)",
+    )
+    parser.add_argument(
+        "--tts-fade-ms",
+        type=float,
+        default=12.0,
+        help="Fade-in/out duration in milliseconds to reduce click/pop",
+    )
+    parser.add_argument(
+        "--tts-packet-ms",
+        type=float,
+        default=40.0,
+        help="UDP packet duration in ms for TTS stream (larger is more robust, smaller has lower latency)",
+    )
+    parser.add_argument(
+        "--tts-send-ahead-ms",
+        type=float,
+        default=0.0,
+        help="Initial buffered audio sent without pacing to absorb Wi-Fi jitter",
+    )
+    parser.add_argument(
+        "--tts-debug-metrics",
+        action="store_true",
+        help="Print PCM metrics before/after shaping for root-cause debugging",
+    )
+    parser.add_argument(
+        "--tts-debug-save-dir",
+        type=Path,
+        default=None,
+        help="If set, save raw/shaped TTS WAV files for offline listening comparison",
+    )
 
     # Fallback model-build knobs (used only when --build-on-start).
     parser.add_argument("--max-points", type=int, default=180)
@@ -155,9 +249,9 @@ def drain_socket(sock: socket.socket, max_packets: int) -> int:
     return drained
 
 
-def recv_sample(sock: socket.socket) -> tuple[int, tuple[float, ...], float] | None:
+def recv_sample(sock: socket.socket) -> tuple[int, tuple[float, ...], float, str] | None:
     try:
-        data, _addr = sock.recvfrom(2048)
+        data, addr = sock.recvfrom(2048)
     except socket.timeout:
         return None
     if len(data) < SIZE:
@@ -165,20 +259,23 @@ def recv_sample(sock: socket.socket) -> tuple[int, tuple[float, ...], float] | N
     ts_us, ax, ay, az, gx, gy, gz = struct.unpack(FMT, data[:SIZE])
     feat = (float(ax), float(ay), float(az), float(gx), float(gy), float(gz))
     gyro_norm = math.sqrt(gx * gx + gy * gy + gz * gz)
-    return ts_us, feat, gyro_norm
+    src_ip = addr[0]
+    return ts_us, feat, gyro_norm, src_ip
 
 
-def capture_fixed_by_ts(sock: socket.socket, duration_sec: float) -> list[tuple[float, ...]]:
+def capture_fixed_by_ts(sock: socket.socket, duration_sec: float) -> tuple[list[tuple[float, ...]], str | None]:
     duration_us = int(duration_sec * 1_000_000)
     seq: list[tuple[float, ...]] = []
     start_ts_us: int | None = None
     last_ts_us: int | None = None
+    src_ip: str | None = None
 
     while True:
         sample = recv_sample(sock)
         if sample is None:
             continue
-        ts_us, feat, _energy = sample
+        ts_us, feat, _energy, ip = sample
+        src_ip = ip
         if start_ts_us is None:
             start_ts_us = ts_us
             last_ts_us = ts_us
@@ -189,7 +286,7 @@ def capture_fixed_by_ts(sock: socket.socket, duration_sec: float) -> list[tuple[
         if ts_us - start_ts_us > duration_us:
             break
         seq.append(feat)
-    return seq
+    return seq, src_ip
 
 
 def capture_triggered(
@@ -204,19 +301,21 @@ def capture_triggered(
     max_action_sec: float,
     max_wait_sec: float,
     expected_hz: float,
-) -> list[tuple[float, ...]]:
+) -> tuple[list[tuple[float, ...]], str | None]:
     pre_len = max(1, int(round(pre_sec * expected_hz)))
-    pre_buf: deque[tuple[int, tuple[float, ...], float]] = deque(maxlen=pre_len)
+    pre_buf: deque[tuple[int, tuple[float, ...], float, str]] = deque(maxlen=pre_len)
     on_count = 0
     wait_deadline = time.monotonic() + max_wait_sec if max_wait_sec > 0 else float("inf")
     last_ts_us: int | None = None
+    src_ip: str | None = None
 
     # Wait for onset.
     while time.monotonic() < wait_deadline:
         sample = recv_sample(sock)
         if sample is None:
             continue
-        ts_us, feat, energy = sample
+        ts_us, feat, energy, ip = sample
+        src_ip = ip
         if last_ts_us is not None and ts_us < last_ts_us:
             continue
         last_ts_us = ts_us
@@ -228,7 +327,7 @@ def capture_triggered(
         if on_count >= max(1, trigger_on_hold):
             break
     else:
-        return []
+        return [], src_ip
 
     # Start capture from pre-trigger buffer.
     seq_samples = list(pre_buf)
@@ -243,10 +342,11 @@ def capture_triggered(
         sample = recv_sample(sock)
         if sample is None:
             continue
-        ts_us, feat, energy = sample
+        ts_us, feat, energy, ip = sample
+        src_ip = ip
         if ts_us < seq_samples[-1][0]:
             continue
-        seq_samples.append((ts_us, feat, energy))
+        seq_samples.append((ts_us, feat, energy, ip))
         elapsed = ts_us - trigger_ts_us
 
         if post_until_us is not None:
@@ -265,7 +365,7 @@ def capture_triggered(
         if elapsed >= min_action_us and off_count >= max(1, trigger_off_hold):
             post_until_us = ts_us + post_us
 
-    return [x[1] for x in seq_samples]
+    return [x[1] for x in seq_samples], src_ip
 
 
 def load_model(model_path: Path) -> tuple[list[LabeledSequence], dict, dict[str, float]]:
@@ -319,6 +419,221 @@ def build_runtime_from_manifest(args: argparse.Namespace) -> tuple[list[LabeledS
     return refs, params, thresholds
 
 
+def label_to_tts_text(label: str, language: str) -> str:
+    if language == "zh":
+        mapping = {
+            "swipe_left": "左滑",
+            "swipe_right": "右滑",
+            "idle": "静止",
+            "unknown": "未知",
+        }
+    else:
+        mapping = {
+            "swipe_left": "swipe left",
+            "swipe_right": "swipe right",
+            "idle": "idle",
+            "unknown": "unknown",
+        }
+    return mapping.get(label, label.replace("_", " "))
+
+
+def synthesize_tts_pcm_with_say(
+    text: str,
+    voice: str,
+    rate_wpm: int,
+    target_sample_rate: int,
+) -> tuple[bytes, int]:
+    if shutil.which("say") is None:
+        raise RuntimeError("macOS 'say' is not available in PATH")
+    if shutil.which("afconvert") is None:
+        raise RuntimeError("macOS 'afconvert' is not available in PATH")
+
+    with tempfile.TemporaryDirectory(prefix="action_tts_") as td:
+        aiff_path = os.path.join(td, "tts.aiff")
+        wav_path = os.path.join(td, "tts.wav")
+        say_cmd = ["say", "-v", voice, "-r", str(rate_wpm), "-o", aiff_path, text]
+        subprocess.run(say_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        cvt_cmd = [
+            "afconvert",
+            "-f",
+            "WAVE",
+            "-d",
+            f"LEI16@{target_sample_rate}",
+            "-c",
+            "1",
+            aiff_path,
+            wav_path,
+        ]
+        subprocess.run(cvt_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        with wave.open(wav_path, "rb") as wf:
+            n_channels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+            src_rate = wf.getframerate()
+            frames = wf.readframes(wf.getnframes())
+
+    if sampwidth != 2 or n_channels != 1 or src_rate != target_sample_rate:
+        raise RuntimeError(
+            f"unexpected WAV format: channels={n_channels} width={sampwidth} rate={src_rate}"
+        )
+    if not frames:
+        raise RuntimeError("TTS output is empty; check macOS voice availability")
+
+    return frames, target_sample_rate
+
+
+def send_pcm_to_board_udp(
+    pcm_bytes: bytes,
+    sample_rate: int,
+    dest_ip: str,
+    dest_port: int,
+    packet_ms: float,
+    send_ahead_ms: float,
+) -> None:
+    if not pcm_bytes:
+        return
+    if len(pcm_bytes) % 2 != 0:
+        pcm_bytes = pcm_bytes[:-1]
+    if not pcm_bytes:
+        return
+
+    samples_per_packet = max(1, int(sample_rate * (packet_ms / 1000.0)))
+    bytes_per_packet = samples_per_packet * 2
+    seq = 0
+    addr = (dest_ip, dest_port)
+    sent_samples = 0
+    ahead_samples = max(0, int(sample_rate * (send_ahead_ms / 1000.0)))
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.sendto(b"AUDS" + struct.pack("<I", sample_rate), addr)
+        for offset in range(0, len(pcm_bytes), bytes_per_packet):
+            chunk = pcm_bytes[offset: offset + bytes_per_packet]
+            sample_count = len(chunk) // 2
+            pkt = b"AUDD" + struct.pack("<HH", seq, sample_count) + chunk
+            sock.sendto(pkt, addr)
+            seq = (seq + 1) & 0xFFFF
+            sent_samples += sample_count
+            if sent_samples > ahead_samples:
+                time.sleep(max(0.0, sample_count / sample_rate))
+        sock.sendto(b"AUDE" + struct.pack("<H", seq), addr)
+
+
+def send_label_to_board_udp(
+    label: str,
+    dest_ip: str,
+    dest_port: int,
+) -> None:
+    payload = label.encode("utf-8")
+    if not payload:
+        return
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.sendto(b"LABL" + payload, (dest_ip, dest_port))
+
+
+def shape_tts_pcm_for_speaker(
+    pcm_bytes: bytes,
+    sample_rate: int,
+    gain: float,
+    target_peak: float,
+    fade_ms: float,
+) -> bytes:
+    if not pcm_bytes:
+        return pcm_bytes
+    pcm = array.array("h")
+    pcm.frombytes(pcm_bytes)
+    if sys.byteorder != "little":
+        pcm.byteswap()
+    n = len(pcm)
+    if n == 0:
+        return b""
+
+    # Remove DC offset so start/end transitions are closer to zero-crossing.
+    dc = int(sum(pcm) / n)
+    peak = 0
+    for i in range(n):
+        v0 = pcm[i] - dc
+        a = abs(v0)
+        if a > peak:
+            peak = a
+
+    applied_gain = gain
+    if peak > 0 and target_peak > 0:
+        target_amp = int(32767 * target_peak)
+        projected_peak = peak * gain
+        if projected_peak > target_amp:
+            applied_gain = gain * (target_amp / projected_peak)
+
+    for i in range(n):
+        v = int((pcm[i] - dc) * applied_gain)
+        if v > 32767:
+            v = 32767
+        elif v < -32768:
+            v = -32768
+        pcm[i] = v
+
+    fade_n = int(sample_rate * (fade_ms / 1000.0))
+    fade_n = max(0, min(fade_n, n // 2))
+    if fade_n > 0:
+        for i in range(fade_n):
+            k = i / fade_n
+            pcm[i] = int(pcm[i] * k)
+            j = n - 1 - i
+            pcm[j] = int(pcm[j] * k)
+
+    pre_pad = int(sample_rate * 0.008)
+    post_pad = int(sample_rate * 0.020)
+    if pre_pad > 0:
+        pcm = array.array("h", [0] * pre_pad) + pcm
+    if post_pad > 0:
+        pcm.extend([0] * post_pad)
+
+    if sys.byteorder != "little":
+        pcm.byteswap()
+    return pcm.tobytes()
+
+
+def pcm_metrics(pcm_bytes: bytes) -> dict[str, float]:
+    pcm = array.array("h")
+    pcm.frombytes(pcm_bytes)
+    if sys.byteorder != "little":
+        pcm.byteswap()
+    n = len(pcm)
+    if n == 0:
+        return {"samples": 0.0, "peak": 0.0, "rms": 0.0, "dc": 0.0, "clip_ratio": 0.0}
+    peak = 0
+    sq = 0
+    dc_sum = 0
+    clipped = 0
+    for v in pcm:
+        a = abs(v)
+        if a > peak:
+            peak = a
+        sq += v * v
+        dc_sum += v
+        if v >= 32767 or v <= -32768:
+            clipped += 1
+    rms = math.sqrt(sq / n)
+    dc = dc_sum / n
+    clip_ratio = clipped / n
+    return {
+        "samples": float(n),
+        "peak": float(peak),
+        "rms": float(rms),
+        "dc": float(dc),
+        "clip_ratio": float(clip_ratio),
+    }
+
+
+def save_pcm_wav(path: Path, pcm_bytes: bytes, sample_rate: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_bytes)
+
+
 def main() -> int:
     args = parse_args()
     if args.k <= 0:
@@ -329,6 +644,22 @@ def main() -> int:
         raise ValueError("trigger thresholds must be >= 0")
     if args.trigger_on < args.trigger_off:
         raise ValueError("--trigger-on must be >= --trigger-off")
+    if args.tts_port <= 0 or args.tts_port > 65535:
+        raise ValueError("--tts-port must be in 1..65535")
+    if args.tts_sample_rate <= 0:
+        raise ValueError("--tts-sample-rate must be > 0")
+    if args.tts_cooldown_sec < 0:
+        raise ValueError("--tts-cooldown-sec must be >= 0")
+    if args.tts_gain < 0 or args.tts_gain > 1.5:
+        raise ValueError("--tts-gain must be in [0, 1.5]")
+    if args.tts_target_peak < 0 or args.tts_target_peak > 1:
+        raise ValueError("--tts-target-peak must be in [0, 1]")
+    if args.tts_fade_ms < 0:
+        raise ValueError("--tts-fade-ms must be >= 0")
+    if args.tts_packet_ms <= 0:
+        raise ValueError("--tts-packet-ms must be > 0")
+    if args.tts_send_ahead_ms < 0:
+        raise ValueError("--tts-send-ahead-ms must be >= 0")
 
     t0 = time.perf_counter()
     if args.model.exists():
@@ -357,6 +688,15 @@ def main() -> int:
     sock.bind((args.host, args.port))
     sock.settimeout(0.25)
     print(f"listening on {args.host}:{args.port}")
+    if args.tts_enable:
+        print(
+            "tts enabled: "
+            f"dest={args.tts_dest_ip}:{args.tts_port} voice={args.tts_voice} "
+            f"lang={args.tts_language} mode={args.tts_output_mode}"
+        )
+
+    last_announce_label: str | None = None
+    last_announce_ts = 0.0
 
     while True:
         if not args.once:
@@ -370,14 +710,14 @@ def main() -> int:
 
         if args.mode == "fixed":
             print(f"capturing fixed window {args.duration_sec:.2f}s by device timestamp...")
-            raw_seq = capture_fixed_by_ts(sock, duration_sec=args.duration_sec)
+            raw_seq, src_ip = capture_fixed_by_ts(sock, duration_sec=args.duration_sec)
         else:
             print(
                 "waiting trigger "
                 f"(on={args.trigger_on:.1f}, off={args.trigger_off:.1f}, "
                 f"max_wait={args.max_wait_sec:.1f}s)..."
             )
-            raw_seq = capture_triggered(
+            raw_seq, src_ip = capture_triggered(
                 sock=sock,
                 trigger_on=args.trigger_on,
                 trigger_off=args.trigger_off,
@@ -437,6 +777,85 @@ def main() -> int:
                 f"{rank}. label={m.label} dist={m.dtw:.4f} xcorr={m.xcorr:.4f} "
                 f"lag={m.lag} ref={m.path}"
             )
+
+        if args.tts_enable and pred != str(params["unknown_label"]):
+            now = time.monotonic()
+            changed = (pred != last_announce_label)
+            cooldown_ok = (now - last_announce_ts) >= args.tts_cooldown_sec
+            repeat_same_label = args.tts_repeat or (args.tts_output_mode == "board-local")
+            if (repeat_same_label or changed) and cooldown_ok:
+                dest_ip = src_ip if args.tts_dest_ip == "auto" else args.tts_dest_ip
+                if dest_ip:
+                    try:
+                        if args.tts_output_mode == "board-local":
+                            send_label_to_board_udp(
+                                label=pred,
+                                dest_ip=dest_ip,
+                                dest_port=args.tts_port,
+                            )
+                            last_announce_label = pred
+                            last_announce_ts = now
+                            print(f"tts_label_sent label={pred} to {dest_ip}:{args.tts_port}")
+                        else:
+                            text = label_to_tts_text(pred, args.tts_language)
+                            pcm, pcm_rate = synthesize_tts_pcm_with_say(
+                                text=text,
+                                voice=args.tts_voice,
+                                rate_wpm=args.tts_rate,
+                                target_sample_rate=args.tts_sample_rate,
+                            )
+                            raw_pcm = pcm
+                            raw_metrics = None
+                            if args.tts_debug_metrics:
+                                raw_metrics = pcm_metrics(raw_pcm)
+                            pcm = shape_tts_pcm_for_speaker(
+                                pcm_bytes=raw_pcm,
+                                sample_rate=pcm_rate,
+                                gain=args.tts_gain,
+                                target_peak=args.tts_target_peak,
+                                fade_ms=args.tts_fade_ms,
+                            )
+                            shaped_metrics = None
+                            if args.tts_debug_metrics:
+                                shaped_metrics = pcm_metrics(pcm)
+                                print(
+                                    "tts_pcm_metrics "
+                                    f"raw(samples={int(raw_metrics['samples'])} peak={raw_metrics['peak']:.0f} "
+                                    f"rms={raw_metrics['rms']:.1f} dc={raw_metrics['dc']:.1f} "
+                                    f"clip={raw_metrics['clip_ratio']*100:.3f}%) "
+                                    f"shaped(samples={int(shaped_metrics['samples'])} peak={shaped_metrics['peak']:.0f} "
+                                    f"rms={shaped_metrics['rms']:.1f} dc={shaped_metrics['dc']:.1f} "
+                                    f"clip={shaped_metrics['clip_ratio']*100:.3f}%)"
+                                )
+                            if args.tts_debug_save_dir:
+                                ts = int(time.time() * 1000)
+                                base = f"{ts}_{pred}"
+                                raw_path = args.tts_debug_save_dir / f"{base}_raw.wav"
+                                shaped_path = args.tts_debug_save_dir / f"{base}_shaped.wav"
+                                save_pcm_wav(raw_path, raw_pcm, pcm_rate)
+                                save_pcm_wav(shaped_path, pcm, pcm_rate)
+                                print(f"tts_wav_saved raw={raw_path} shaped={shaped_path}")
+                            send_pcm_to_board_udp(
+                                pcm_bytes=pcm,
+                                sample_rate=pcm_rate,
+                                dest_ip=dest_ip,
+                                dest_port=args.tts_port,
+                                packet_ms=args.tts_packet_ms,
+                                send_ahead_ms=args.tts_send_ahead_ms,
+                            )
+                            last_announce_label = pred
+                            last_announce_ts = now
+                            print(f"tts_sent label={pred} to {dest_ip}:{args.tts_port}")
+                    except Exception as e:
+                        print(f"tts_error: {e}")
+                else:
+                    print("tts_skip: destination ip unavailable")
+            else:
+                if not cooldown_ok:
+                    elapsed = now - last_announce_ts
+                    print(f"tts_skip: cooldown({elapsed:.2f}s<{args.tts_cooldown_sec:.2f}s)")
+                elif not changed:
+                    print("tts_skip: same_label (enable --tts-repeat for stream mode)")
 
         if args.once:
             return 0

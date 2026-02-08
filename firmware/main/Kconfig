@@ -24,4 +24,12 @@ config ACTION_NET_PROVISION_ON_BOOT
     bool "Provision NVS from Kconfig on boot (only missing keys)"
     default n
 
+config ACTION_AUDIO_CMD_PORT
+    int "UDP listen port for audio command/stream"
+    default 9001
+
+config ACTION_LABEL_AUDIO_SAMPLE_RATE
+    int "Sample rate for embedded board-local label clips (Hz)"
+    default 24000
+
 endmenu

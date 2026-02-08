@@ -41,6 +41,32 @@ Optional one-shot mode:
 
 - `python3 pc/live_classify.py --model data/model/action_model.json --mode trigger --once`
 
+### Speak Label on Board Speaker (TTS)
+When prediction is not `unknown`, synthesize label TTS on PC and stream PCM to board:
+
+- `python3 pc/live_classify.py --model data/model/action_model.json --mode trigger --k 5 --tts-enable --tts-dest-ip auto --tts-port 9001`
+
+Board-local playback mode (recommended for robustness):
+
+- `python3 pc/live_classify.py --model data/model/action_model.json --mode trigger --k 5 --tts-enable --tts-output-mode board-local --tts-dest-ip auto --tts-port 9001`
+
+Notes:
+- Current implementation uses macOS `say` command as TTS backend.
+- `--tts-dest-ip auto` sends audio to source IP of incoming IMU packets.
+- `--tts-output-mode board-local` sends only the label (`LABL` packet). Board plays preloaded PCM clip.
+- `board-local` mode avoids most Wi-Fi streaming distortion and is now the preferred mode.
+- In `board-local` mode, same-label detections are announced by default (still rate-limited by `--tts-cooldown-sec`).
+- In `board-local` mode, `--tts-voice`, `--tts-language`, `--tts-gain`, `--tts-target-peak`, `--tts-fade-ms`
+  do not affect board playback audio content (they are only used in `stream` mode).
+- `board-local` mode requires firmware that embeds clips from `firmware/main/audio_labels/*.pcm`.
+- Voice/language tuning:
+  - `--tts-voice Tingting --tts-language zh`
+  - `--tts-voice Samantha --tts-language en`
+- Anti-pop tuning:
+  - `--tts-gain 0.18` to `--tts-gain 0.30` (lower if distorted)
+  - `--tts-target-peak 0.20` to `--tts-target-peak 0.30` (auto limits peak level)
+  - `--tts-fade-ms 15`
+
 If model file is missing, temporary fallback is available (slow startup):
 
 - `python3 pc/live_classify.py --build-on-start --manifest data/labels/manifest.jsonl`

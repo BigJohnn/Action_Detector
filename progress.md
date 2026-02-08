@@ -30,3 +30,6 @@
 - System update in progress: timestamp-based windowing + UDP drain, offline model artifact (`pc/build_model.py`), trigger-based online capture.
 - Latest empirical quality: `swipe_left/right` good; `idle` not yet production-ready.
 - Complex action design notes added: `docs/complex_action_strategy.md`.
+- Added action label voice playback path: PC-side TTS + UDP PCM stream -> board PDM speaker.
+- Audio quality hardening in progress: auto peak-limit + DC offset removal on PC TTS PCM; board side now keeps PA alive across short gaps and applies small-loss packet concealment.
+- Added board-local label playback path: PC sends `LABL` command only, board plays embedded PCM clips (`swipe_left`, `swipe_right`, `idle`) to reduce streaming-induced distortion.
