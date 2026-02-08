@@ -1,13 +1,12 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-This repository is currently empty (no source files committed yet). When you add code, keep a clear top-level layout, for example:
-- `src/` for application code
-- `tests/` for automated tests
-- `scripts/` for developer tooling
-- `docs/` for design notes and architecture
-
-If you introduce new directories, document them here.
+Current top-level layout:
+- `firmware/` ESP-IDF firmware for BMI270 + UDP streaming
+- `pc/` host-side Python utilities
+- `scripts/` developer helper scripts
+- `docs/` workflow and design notes
+- `data/` runtime artifacts (raw CSV, label manifest, built model), gitignored
 
 ## Build, Test, and Development Commands
 No build or test commands are defined yet. Once tooling is added, list the canonical commands and what they do, for example:
